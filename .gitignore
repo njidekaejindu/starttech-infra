@@ -1,0 +1,14 @@
+# Terraform local-only files
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Terraform variable files that may contain secrets
+*.tfvars
+*.tfvars.json
+
+# Editor folders
+.vscode/
+.idea/

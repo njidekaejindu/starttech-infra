@@ -1,1 +1,4 @@
-TODO: implement in later steps
+aws_region   = "us-east-1"
+project_name = "starttech"
+environment  = "dev"
+
