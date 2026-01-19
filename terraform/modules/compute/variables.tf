@@ -54,4 +54,8 @@ variable "enable_alb_only_test" {
   default     = false
 }
 
+variable "aws_region" {
+  type        = string
+  description = "AWS region (used by user_data for ECR login/pull)"
+}
 

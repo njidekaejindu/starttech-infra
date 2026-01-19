@@ -28,6 +28,22 @@ resource "aws_cloudfront_distribution" "frontend" {
     origin_access_control_id = aws_cloudfront_origin_access_control.frontend.id
   }
 
+  ordered_cache_behavior {
+    path_pattern           = "/health"
+    target_origin_id       = "alb-backend"
+    viewer_protocol_policy = "redirect-to-https"
+
+    allowed_methods = ["GET", "HEAD", "OPTIONS"]
+    cached_methods  = ["GET", "HEAD"]
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+  }
+
   default_cache_behavior {
     target_origin_id       = "s3-frontend"
     viewer_protocol_policy = "redirect-to-https"
@@ -66,6 +82,18 @@ resource "aws_cloudfront_distribution" "frontend" {
     Name        = "${local.name_prefix}-cf"
     Project     = var.project_name
     Environment = var.environment
+  }
+
+  origin {
+    domain_name = var.alb_dns_name
+    origin_id   = "alb-backend"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
   }
 }
 

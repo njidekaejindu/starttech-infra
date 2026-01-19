@@ -39,12 +39,19 @@ module "compute" {
   desired_capacity = var.backend_desired_capacity
   min_size         = var.backend_min_size
   max_size         = var.backend_max_size
+
+  aws_region = var.aws_region
+
 }
 module "storage" {
   source = "./modules/storage"
 
   project_name = var.project_name
   environment  = var.environment
+
+  alb_dns_name = module.compute.alb_dns_name
+
+  aws_region = var.aws_region
 }
 
 

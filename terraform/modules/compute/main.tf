@@ -82,13 +82,13 @@ resource "aws_lb_target_group" "backend" {
   target_type = "instance"
 
   health_check {
-    path                = "/"
+    path                = "/health"
     protocol            = "HTTP"
     port                = "traffic-port"
     interval            = 30
     timeout             = 5
     healthy_threshold   = 2
-    unhealthy_threshold = 3
+    unhealthy_threshold = 2
     matcher             = "200"
   }
 
@@ -121,6 +121,37 @@ data "aws_ami" "al2023" {
   }
 }
 
+# --- IAM for EC2 to pull from ECR ---
+data "aws_iam_policy_document" "ec2_assume_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "backend_ec2_role" {
+  name               = "${local.name_prefix}-ec2-role"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "ecr_readonly" {
+  role       = aws_iam_role.backend_ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.backend_ec2_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "backend_profile" {
+  name = "${local.name_prefix}-instance-profile"
+  role = aws_iam_role.backend_ec2_role.name
+}
+
 # --- Launch Template ---
 resource "aws_launch_template" "backend" {
   name_prefix   = "${local.name_prefix}-lt-"
@@ -128,37 +159,52 @@ resource "aws_launch_template" "backend" {
   instance_type = var.instance_type
 
   vpc_security_group_ids = [aws_security_group.backend_sg.id]
-
-  key_name = var.ssh_key_name != "" ? var.ssh_key_name : null
+  key_name               = var.ssh_key_name != "" ? var.ssh_key_name : null
 
   user_data = base64encode(<<-EOF
 #!/bin/bash
-set -e
+set -euxo pipefail
 
-# Simple reliable health server on port 8080 using Python
-cat >/opt/health_server.py <<'PY'
-from http.server import BaseHTTPRequestHandler, HTTPServer
+# Log user_data clearly
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ("/health", "/"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"ok")
-        else:
-            self.send_response(404)
-            self.end_headers()
+dnf -y update
+dnf -y install docker awscli
 
-    def log_message(self, format, *args):
-        return
+systemctl enable --now docker
+usermod -aG docker ec2-user || true
 
-HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
-PY
+REGION="${var.aws_region}"
 
-nohup python3 /opt/health_server.py >/var/log/starttech-health.log 2>&1 &
+# IMDSv2 token (safe)
+TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)
+
+if [ -n "$TOKEN" ]; then
+  ACCOUNT_ID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document | grep accountId | awk -F'"' '{print $4}')
+else
+  ACCOUNT_ID=$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | grep accountId | awk -F'"' '{print $4}')
+fi
+
+REGISTRY="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
+IMAGE="$REGISTRY/starttech-backend:dev"
+
+# Login to ECR (requires IAM role attached to instance)
+aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+
+# Pull & run
+docker pull "$IMAGE"
+
+docker rm -f starttech || true
+docker run -d --name starttech --restart always -p 8080:8080 "$IMAGE"
+
+# Optional: show container status in logs
+docker ps -a
 EOF
   )
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.backend_profile.name
+  }
 
   tag_specifications {
     resource_type = "instance"
@@ -172,22 +218,28 @@ EOF
 
 # --- Auto Scaling Group ---
 resource "aws_autoscaling_group" "backend" {
-
-  launch_template {
-    id      = aws_launch_template.backend.id
-    version = "$Latest"
-  }
-
   name                = "${local.name_prefix}-asg"
   desired_capacity    = var.desired_capacity
   min_size            = var.min_size
   max_size            = var.max_size
   vpc_zone_identifier = var.app_private_subnet_ids
 
+  launch_template {
+    id      = aws_launch_template.backend.id
+    version = aws_launch_template.backend.latest_version
+  }
+
   health_check_type         = "ELB"
   health_check_grace_period = 120
+  target_group_arns         = [aws_lb_target_group.backend.arn]
 
-  target_group_arns = [aws_lb_target_group.backend.arn]
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 50
+      instance_warmup        = 120
+    }
+  }
 
   tag {
     key                 = "Name"
@@ -207,4 +259,3 @@ resource "aws_autoscaling_group" "backend" {
     propagate_at_launch = true
   }
 }
-
